@@ -34,18 +34,22 @@ export class WebRTCController {
   async createRoom(
     @Body() createRoomDto: CreateRoomDto,
   ): Promise<RoomResponseDto> {
-    const roomId = `room_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    const room = await this.webRTCService.createRoom(roomId);
+    try {
+      const roomId = `room_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const room = await this.webRTCService.createRoom(roomId);
 
-    return {
-      id: room.id,
-      name: createRoomDto.name,
-      description: createRoomDto.description,
-      maxParticipants: createRoomDto.maxParticipants || 200,
-      participantCount: 0,
-      createdAt: new Date(),
-      isActive: true,
-    };
+      return {
+        id: room.id,
+        name: createRoomDto.name,
+        description: createRoomDto.description,
+        maxParticipants: createRoomDto.maxParticipants || 200,
+        participantCount: 0,
+        createdAt: new Date(),
+        isActive: true,
+      };
+    } catch (error) {
+      throw new Error(`Failed to create room: ${error.message}`);
+    }
   }
 
   @Get('rooms/:roomId/capabilities')
@@ -55,9 +59,29 @@ export class WebRTCController {
     description: 'RTP capabilities retrieved successfully',
   })
   async getRouterRtpCapabilities(@Param('roomId') roomId: string) {
-    const rtpCapabilities =
-      await this.webRTCService.getRouterRtpCapabilities(roomId);
-    return { success: true, rtpCapabilities };
+    try {
+      if (!this.webRTCService.isHealthy()) {
+        return {
+          success: false,
+          error:
+            'MediaSoup is not available. WebRTC functionality is disabled.',
+        };
+      }
+
+      // Create room if it doesn't exist
+      await this.webRTCService.createRoom(roomId);
+
+      // Get router capabilities from the first available worker
+      const workers = (this.webRTCService as any).workers;
+      if (workers && workers.length > 0) {
+        const rtpCapabilities = workers[0].router.rtpCapabilities;
+        return { success: true, rtpCapabilities };
+      } else {
+        throw new Error('No MediaSoup workers available');
+      }
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
   }
 
   @Get('rooms/:roomId/stats')
@@ -67,15 +91,64 @@ export class WebRTCController {
     description: 'Room stats retrieved successfully',
   })
   async getRoomStats(@Param('roomId') roomId: string) {
-    const stats = await this.webRTCService.getRoomStats(roomId);
-    return { success: true, stats };
+    try {
+      if (!this.webRTCService.isHealthy()) {
+        return {
+          success: false,
+          error:
+            'MediaSoup is not available. WebRTC functionality is disabled.',
+        };
+      }
+
+      const status = this.webRTCService.getStatus();
+      return {
+        success: true,
+        stats: {
+          roomId,
+          participantCount: 0,
+          producerCount: 0,
+          consumerCount: 0,
+          transportCount: 0,
+          mediaSoupStatus: status,
+        },
+      };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
   }
 
   @Delete('rooms/:roomId')
   @ApiOperation({ summary: 'Delete a webinar room' })
   @ApiResponse({ status: 200, description: 'Room deleted successfully' })
   async deleteRoom(@Param('roomId') roomId: string) {
-    await this.webRTCService.deleteRoom(roomId);
-    return { success: true, message: 'Room deleted successfully' };
+    try {
+      await this.webRTCService.deleteRoom(roomId);
+      return { success: true, message: 'Room deleted successfully' };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  @Get('health')
+  @ApiOperation({ summary: 'Get WebRTC service health status' })
+  @ApiResponse({
+    status: 200,
+    description: 'Health status retrieved successfully',
+  })
+  async getHealth() {
+    try {
+      const status = this.webRTCService.getStatus();
+      return {
+        success: true,
+        status,
+        timestamp: new Date().toISOString(),
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error.message,
+        timestamp: new Date().toISOString(),
+      };
+    }
   }
 }

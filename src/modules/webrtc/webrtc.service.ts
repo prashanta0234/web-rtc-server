@@ -32,78 +32,107 @@ export class WebRTCService implements OnModuleInit {
   private readonly logger = new Logger(WebRTCService.name);
   private workers: Worker[] = [];
   private nextWorkerIndex = 0;
+  private isMediaSoupAvailable = false;
 
   constructor(private configService: ConfigService) {}
 
   async onModuleInit() {
-    await this.createWorkers();
+    try {
+      await this.createWorkers();
+      this.isMediaSoupAvailable = true;
+      this.logger.log('MediaSoup workers initialized successfully');
+    } catch (error) {
+      this.logger.warn(
+        'MediaSoup initialization failed, running in limited mode:',
+        error.message,
+      );
+      this.isMediaSoupAvailable = false;
+      // Don't throw error, allow the app to start without MediaSoup
+    }
   }
 
   private async createWorkers(): Promise<void> {
     const numWorkers = 4; // Number of CPU cores
 
     for (let i = 0; i < numWorkers; i++) {
-      const worker = await mediasoup.createWorker({
-        logLevel: this.configService.get('mediasoup.worker.logLevel'),
-        logTags: [this.configService.get('mediasoup.worker.logTag')],
-        rtcMinPort: this.configService.get('mediasoup.worker.rtcMinPort'),
-        rtcMaxPort: this.configService.get('mediasoup.worker.rtcMaxPort'),
-      });
+      try {
+        const worker = await mediasoup.createWorker({
+          logLevel: this.configService.get('mediasoup.worker.logLevel'),
+          logTags: [this.configService.get('mediasoup.worker.logTag')],
+          rtcMinPort: this.configService.get('mediasoup.worker.rtcMinPort'),
+          rtcMaxPort: this.configService.get('mediasoup.worker.rtcMaxPort'),
+        });
 
-      worker.on('died', () => {
+        worker.on('died', () => {
+          this.logger.error(
+            'MediaSoup worker died, exiting in 2 seconds... [pid:%d]',
+            worker.pid,
+          );
+          setTimeout(() => process.exit(1), 2000);
+        });
+
+        const router = await worker.createRouter({
+          mediaCodecs: [
+            {
+              kind: 'audio',
+              mimeType: 'audio/opus',
+              clockRate: 48000,
+              channels: 2,
+            },
+            {
+              kind: 'video',
+              mimeType: 'video/VP8',
+              clockRate: 90000,
+              parameters: {
+                'x-google-start-bitrate': 1000,
+              },
+            },
+            {
+              kind: 'video',
+              mimeType: 'video/H264',
+              clockRate: 90000,
+              parameters: {
+                'packetization-mode': 1,
+                'profile-level-id': '42e01f',
+                'level-asymmetry-allowed': 1,
+              },
+            },
+          ],
+        });
+
+        this.workers.push({
+          worker,
+          router,
+          rooms: new Map(),
+        });
+
+        this.logger.log(`MediaSoup worker created [pid:${worker.pid}]`);
+      } catch (error) {
         this.logger.error(
-          'MediaSoup worker died, exiting in 2 seconds... [pid:%d]',
-          worker.pid,
+          `Failed to create MediaSoup worker ${i}:`,
+          error.message,
         );
-        setTimeout(() => process.exit(1), 2000);
-      });
-
-      const router = await worker.createRouter({
-        mediaCodecs: [
-          {
-            kind: 'audio',
-            mimeType: 'audio/opus',
-            clockRate: 48000,
-            channels: 2,
-          },
-          {
-            kind: 'video',
-            mimeType: 'video/VP8',
-            clockRate: 90000,
-            parameters: {
-              'x-google-start-bitrate': 1000,
-            },
-          },
-          {
-            kind: 'video',
-            mimeType: 'video/H264',
-            clockRate: 90000,
-            parameters: {
-              'packetization-mode': 1,
-              'profile-level-id': '42e01f',
-              'level-asymmetry-allowed': 1,
-            },
-          },
-        ],
-      });
-
-      this.workers.push({
-        worker,
-        router,
-        rooms: new Map(),
-      });
-
-      this.logger.log(`MediaSoup worker created [pid:${worker.pid}]`);
+        throw error; // Re-throw to stop worker creation
+      }
     }
   }
 
   private getWorker(): Worker {
+    if (!this.isMediaSoupAvailable || this.workers.length === 0) {
+      throw new Error('MediaSoup is not available');
+    }
     const worker = this.workers[this.nextWorkerIndex];
     this.nextWorkerIndex = (this.nextWorkerIndex + 1) % this.workers.length;
     return worker;
   }
 
   async createRoom(roomId: string): Promise<Room> {
+    if (!this.isMediaSoupAvailable) {
+      throw new Error(
+        'MediaSoup is not available. WebRTC functionality is disabled.',
+      );
+    }
+
     const worker = this.getWorker();
 
     if (worker.rooms.has(roomId)) {
@@ -126,6 +155,10 @@ export class WebRTCService implements OnModuleInit {
   }
 
   async deleteRoom(roomId: string): Promise<void> {
+    if (!this.isMediaSoupAvailable) {
+      return;
+    }
+
     for (const worker of this.workers) {
       const room = worker.rooms.get(roomId);
       if (room) {
@@ -146,7 +179,7 @@ export class WebRTCService implements OnModuleInit {
 
         worker.rooms.delete(roomId);
         this.logger.log(`Room deleted: ${roomId}`);
-        return;
+        break;
       }
     }
   }
@@ -154,46 +187,65 @@ export class WebRTCService implements OnModuleInit {
   async createTransport(
     roomId: string,
     direction: 'send' | 'recv',
-  ): Promise<{
-    transport: mediasoup.types.WebRtcTransport;
-    params: any;
-  }> {
-    const room = this.getRoom(roomId);
+  ): Promise<any> {
+    if (!this.isMediaSoupAvailable) {
+      throw new Error(
+        'MediaSoup is not available. WebRTC functionality is disabled.',
+      );
+    }
+
+    const room = await this.findRoom(roomId);
+    if (!room) {
+      throw new Error(`Room ${roomId} not found`);
+    }
 
     const transport = await room.router.createWebRtcTransport({
       listenIps: [
         {
-          ip: this.configService.get('mediasoup.webRtc.listenIp'),
-          announcedIp: this.configService.get('mediasoup.webRtc.announcedIp'),
+          ip: this.configService.get('webrtc.listenIp'),
+          announcedIp: this.configService.get('webrtc.announcedIp'),
         },
       ],
       enableUdp: true,
       enableTcp: true,
       preferUdp: true,
       initialAvailableOutgoingBitrate: 1000000,
+      maxSctpMessageSize: 262144,
     });
 
     room.transports.set(transport.id, transport);
 
-    const params = {
+    transport.on('@close', () => {
+      this.logger.log('Transport closed:', transport.id);
+      room.transports.delete(transport.id);
+    });
+
+    return {
       id: transport.id,
       iceParameters: transport.iceParameters,
       iceCandidates: transport.iceCandidates,
       dtlsParameters: transport.dtlsParameters,
       sctpParameters: transport.sctpParameters,
     };
-
-    return { transport, params };
   }
 
   async connectTransport(
     roomId: string,
     transportId: string,
-    dtlsParameters: mediasoup.types.DtlsParameters,
+    dtlsParameters: any,
   ): Promise<void> {
-    const room = this.getRoom(roomId);
-    const transport = room.transports.get(transportId);
+    if (!this.isMediaSoupAvailable) {
+      throw new Error(
+        'MediaSoup is not available. WebRTC functionality is disabled.',
+      );
+    }
 
+    const room = await this.findRoom(roomId);
+    if (!room) {
+      throw new Error(`Room ${roomId} not found`);
+    }
+
+    const transport = room.transports.get(transportId);
     if (!transport) {
       throw new Error(`Transport ${transportId} not found`);
     }
@@ -205,12 +257,21 @@ export class WebRTCService implements OnModuleInit {
     roomId: string,
     transportId: string,
     kind: 'audio' | 'video',
-    rtpParameters: mediasoup.types.RtpParameters,
+    rtpParameters: any,
     appData?: any,
-  ): Promise<mediasoup.types.Producer> {
-    const room = this.getRoom(roomId);
-    const transport = room.transports.get(transportId);
+  ): Promise<any> {
+    if (!this.isMediaSoupAvailable) {
+      throw new Error(
+        'MediaSoup is not available. WebRTC functionality is disabled.',
+      );
+    }
 
+    const room = await this.findRoom(roomId);
+    if (!room) {
+      throw new Error(`Room ${roomId} not found`);
+    }
+
+    const transport = room.transports.get(transportId);
     if (!transport) {
       throw new Error(`Transport ${transportId} not found`);
     }
@@ -234,36 +295,37 @@ export class WebRTCService implements OnModuleInit {
 
     room.producers.set(producer.id, producer);
 
-    producer.on('transportclose', () => {
-      this.logger.log('Producer transport closed');
-      room.producers.delete(producer.id);
-    });
-
     producer.on('@close', () => {
-      this.logger.log('Producer closed');
+      this.logger.log('Producer closed:', producer.id);
       room.producers.delete(producer.id);
     });
 
-    return producer;
+    return { producerId: producer.id };
   }
 
   async consume(
     roomId: string,
     transportId: string,
     producerId: string,
-    rtpCapabilities: mediasoup.types.RtpCapabilities,
-  ): Promise<{
-    consumer: mediasoup.types.Consumer;
-    params: any;
-  }> {
-    const room = this.getRoom(roomId);
-    const transport = room.transports.get(transportId);
-    const producer = room.producers.get(producerId);
+    rtpCapabilities: any,
+  ): Promise<any> {
+    if (!this.isMediaSoupAvailable) {
+      throw new Error(
+        'MediaSoup is not available. WebRTC functionality is disabled.',
+      );
+    }
 
+    const room = await this.findRoom(roomId);
+    if (!room) {
+      throw new Error(`Room ${roomId} not found`);
+    }
+
+    const transport = room.transports.get(transportId);
     if (!transport) {
       throw new Error(`Transport ${transportId} not found`);
     }
 
+    const producer = room.producers.get(producerId);
     if (!producer) {
       throw new Error(`Producer ${producerId} not found`);
     }
@@ -276,62 +338,51 @@ export class WebRTCService implements OnModuleInit {
       producerId,
       rtpCapabilities,
       paused: false,
-      appData: { mediaPeerId: producer.appData?.mediaPeerId },
     });
 
     room.consumers.set(consumer.id, consumer);
 
-    consumer.on('transportclose', () => {
-      this.logger.log('Consumer transport closed');
-      room.consumers.delete(consumer.id);
-    });
-
     consumer.on('@close', () => {
-      this.logger.log('Consumer closed');
+      this.logger.log('Consumer closed:', consumer.id);
       room.consumers.delete(consumer.id);
     });
 
-    const params = {
+    return {
       id: consumer.id,
       producerId: consumer.producerId,
       kind: consumer.kind,
       rtpParameters: consumer.rtpParameters,
       type: consumer.type,
-      appData: consumer.appData,
       producerPaused: consumer.producerPaused,
     };
-
-    return { consumer, params };
   }
 
-  async getRouterRtpCapabilities(
-    roomId: string,
-  ): Promise<mediasoup.types.RtpCapabilities> {
-    const room = this.getRoom(roomId);
-    return room.router.rtpCapabilities;
-  }
-
-  private getRoom(roomId: string): Room {
+  private async findRoom(roomId: string): Promise<Room | undefined> {
     for (const worker of this.workers) {
       const room = worker.rooms.get(roomId);
       if (room) {
         return room;
       }
     }
-    throw new Error(`Room ${roomId} not found`);
+    return undefined;
   }
 
-  async getRoomStats(roomId: string): Promise<any> {
-    const room = this.getRoom(roomId);
+  // Health check method
+  isHealthy(): boolean {
+    return this.isMediaSoupAvailable && this.workers.length > 0;
+  }
 
-    const stats = {
-      roomId,
-      participantCount: room.peers.size,
-      producerCount: room.producers.size,
-      consumerCount: room.consumers.size,
-      transportCount: room.transports.size,
+  // Get service status
+  getStatus(): { available: boolean; workerCount: number; roomCount: number } {
+    let totalRooms = 0;
+    for (const worker of this.workers) {
+      totalRooms += worker.rooms.size;
+    }
+
+    return {
+      available: this.isMediaSoupAvailable,
+      workerCount: this.workers.length,
+      roomCount: totalRooms,
     };
-
-    return stats;
   }
 }

@@ -68,9 +68,27 @@ export class WebRTCGateway implements OnGatewayConnection, OnGatewayDisconnect {
   ) {
     try {
       const { roomId } = data;
-      const rtpCapabilities =
-        await this.webRTCService.getRouterRtpCapabilities(roomId);
-      return { success: true, rtpCapabilities };
+
+      // Check if MediaSoup is available
+      if (!this.webRTCService.isHealthy()) {
+        return {
+          success: false,
+          error:
+            'MediaSoup is not available. WebRTC functionality is disabled.',
+        };
+      }
+
+      // Create room if it doesn't exist
+      await this.webRTCService.createRoom(roomId);
+
+      // Get router capabilities from the first available worker
+      const workers = (this.webRTCService as any).workers;
+      if (workers && workers.length > 0) {
+        const rtpCapabilities = workers[0].router.rtpCapabilities;
+        return { success: true, rtpCapabilities };
+      } else {
+        throw new Error('No MediaSoup workers available');
+      }
     } catch (error) {
       this.logger.error(`Error getting RTP capabilities: ${error.message}`);
       return { success: false, error: error.message };
@@ -83,7 +101,17 @@ export class WebRTCGateway implements OnGatewayConnection, OnGatewayDisconnect {
   ) {
     try {
       const { roomId, direction } = data;
-      const { transport, params } = await this.webRTCService.createTransport(
+
+      // Check if MediaSoup is available
+      if (!this.webRTCService.isHealthy()) {
+        return {
+          success: false,
+          error:
+            'MediaSoup is not available. WebRTC functionality is disabled.',
+        };
+      }
+
+      const params = await this.webRTCService.createTransport(
         roomId,
         direction,
       );
@@ -130,7 +158,17 @@ export class WebRTCGateway implements OnGatewayConnection, OnGatewayDisconnect {
   ) {
     try {
       const { roomId, transportId, kind, rtpParameters, appData } = data;
-      const producer = await this.webRTCService.produce(
+
+      // Check if MediaSoup is available
+      if (!this.webRTCService.isHealthy()) {
+        return {
+          success: false,
+          error:
+            'MediaSoup is not available. WebRTC functionality is disabled.',
+        };
+      }
+
+      const result = await this.webRTCService.produce(
         roomId,
         transportId,
         kind,
@@ -139,12 +177,12 @@ export class WebRTCGateway implements OnGatewayConnection, OnGatewayDisconnect {
       );
 
       this.server.to(roomId).emit('new-producer', {
-        producerId: producer.id,
-        kind: producer.kind,
-        appData: producer.appData,
+        producerId: result.producerId,
+        kind,
+        appData,
       });
 
-      return { success: true, producerId: producer.id };
+      return { success: true, producerId: result.producerId };
     } catch (error) {
       this.logger.error(`Error producing: ${error.message}`);
       return { success: false, error: error.message };
@@ -163,7 +201,17 @@ export class WebRTCGateway implements OnGatewayConnection, OnGatewayDisconnect {
   ) {
     try {
       const { roomId, transportId, producerId, rtpCapabilities } = data;
-      const { consumer, params } = await this.webRTCService.consume(
+
+      // Check if MediaSoup is available
+      if (!this.webRTCService.isHealthy()) {
+        return {
+          success: false,
+          error:
+            'MediaSoup is not available. WebRTC functionality is disabled.',
+        };
+      }
+
+      const params = await this.webRTCService.consume(
         roomId,
         transportId,
         producerId,
