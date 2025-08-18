@@ -1,12 +1,16 @@
-# Use Node.js 18 LTS for better compatibility
-FROM node:20-alpine
+# Use Debian-based Node.js 20
+FROM node:20-slim
 
 # Install system dependencies
-RUN apk add --no-cache \
+RUN apt-get update && apt-get install -y \
     python3 \
+    python3-pip \
     make \
     g++ \
-    && rm -rf /var/cache/apk/*
+    bash \
+    libc-dev \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
@@ -14,24 +18,26 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies with production flag
-RUN npm ci --only=production --ignore-scripts
+# Install ALL dependencies (skip mediasoup postinstall first)
+RUN npm ci --ignore-scripts
 
 # Copy source code
 COPY . .
 
-# Build the application
+# Now build mediasoup worker
+RUN npm rebuild mediasoup
+
+# Build the NestJS app
 RUN npm run build
 
-# Create non-root user
-RUN addgroup -g 1001 -S nodejs
-RUN adduser -S nestjs -u 1001
+# Prune dev dependencies
+RUN npm prune --production
 
-# Change ownership of the app directory
-RUN chown -R nestjs:nodejs /app
+# Create non-root user
+RUN useradd -m nestjs
 USER nestjs
 
-# Expose port (will be overridden by Render)
+# Expose port
 EXPOSE 5050
 
 # Health check
